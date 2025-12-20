@@ -30,7 +30,7 @@ const int WIDTH = 1000;
 const int HEIGHT = 500;
 
 // 使用相对于可执行文件的路径
-const std::string MODEL_PATH = "models/M4A1.obj";
+const std::string MODEL_PATH = "D:/code/w_cplus/engine/Hedge/external/bullet/examples/pybullet/gym/pybullet_data/random_urdfs/003/003.obj";
 const std::string TEXTURE_PATH = "textures/globe.jpg";
 
 const std::vector<const char*> validationLayers = {"VK_LAYER_LUNARG_standard_validation"};
@@ -237,30 +237,30 @@ private:
 
     void initVulkan()
     {
-        createInstance();
-        setupDebugCallback();
-        createSurface();
-        pickPhysicalDevice();
-        createLogicalDevice();
-        createSwapChain();
-        createImageViews();
-        createRenderPass();
-        createDescriptorSetLayout();
-        createGraphicsPipeline();
-        createCommandPool();
-        createDepthResources();
-        createFramebuffers();
-        createTextureImage();
-        createTextureImageView();
-        createTextureSampler();
-        loadModel();
-        createVertexBuffer();
-        createIndexBuffer();
-        createUniformBuffer();
-        createDescriptorPool();
-        createDescriptorSet();
-        createCommandBuffers();
-        createSemaphores();
+        createInstance();            // 创建Vulkan实例
+        setupDebugCallback();        // 设置调试回调
+        createSurface();             // 创建窗口表面
+        pickPhysicalDevice();        // 选择物理设备
+        createLogicalDevice();       // 创建逻辑设备
+        createSwapChain();           // 创建交换链
+        createImageViews();          // 创建图像视图
+        createRenderPass();          // 创建渲染通道
+        createDescriptorSetLayout(); // 创建描述符集布局
+        createGraphicsPipeline();    // 创建图形管线
+        createCommandPool();         // 创建命令池
+        createDepthResources();      // 创建深度资源
+        createFramebuffers();        // 创建帧缓冲区
+        createTextureImage();        // 创建纹理图像
+        createTextureImageView();    // 创建纹理图像视图
+        createTextureSampler();      // 创建纹理采样器
+        loadModel();                 // 加载模型
+        createVertexBuffer();        // 创建顶点缓冲区
+        createIndexBuffer();         // 创建索引缓冲区
+        createUniformBuffer();       // 创建统一缓冲区
+        createDescriptorPool();      // 创建描述符池
+        createDescriptorSet();       // 创建描述符集
+        createCommandBuffers();      // 创建命令缓冲区
+        createSemaphores();          // 创建信号量
     }
 
     void mainLoop()
@@ -1172,48 +1172,6 @@ private:
         endSingleTimeCommands(commandBuffer);
     }
 
-    /*
-    struct Vertex {
-        glm::vec3 pos;
-        glm::vec3 color;
-        glm::vec2 texCoord;
-
-        static VkVertexInputBindingDescription getBindingDescription() {
-            VkVertexInputBindingDescription bindingDescription = {};
-            bindingDescription.binding = 0;
-            bindingDescription.stride = sizeof(Vertex);
-            bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-            return bindingDescription;
-        }
-
-        static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions() {
-            std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = {};
-
-            attributeDescriptions[0].binding = 0;
-            attributeDescriptions[0].location = 0;
-            attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-            attributeDescriptions[0].offset = offsetof(Vertex, pos);
-
-            attributeDescriptions[1].binding = 0;
-            attributeDescriptions[1].location = 1;
-            attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-            attributeDescriptions[1].offset = offsetof(Vertex, color);
-
-            attributeDescriptions[2].binding = 0;
-            attributeDescriptions[2].location = 2;
-            attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
-            attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
-
-            return attributeDescriptions;
-        }
-
-        bool operator==(const Vertex& other) const {
-            return pos == other.pos && color == other.color && texCoord == other.texCoord;
-        }
-    };
-    */
-
     class Mesh
     {
     public:
@@ -1293,46 +1251,6 @@ private:
         std::cout << "模型加载成功，网格数量: " << meshes.size() << std::endl;
     }
 
-    /*
-        void loadModel() {
-            tinyobj::attrib_t attrib;
-            std::vector<tinyobj::shape_t> shapes;
-            std::vector<tinyobj::material_t> materials;
-            std::string err;
-
-            if (!tinyobj::LoadObj(&attrib, &shapes, &materials, &err, MODEL_PATH.c_str())) {
-                throw std::runtime_error(err);
-            }
-
-            std::unordered_map<Vertex, uint32_t> uniqueVertices = {};
-
-            for (const auto& shape : shapes) {
-                for (const auto& index : shape.mesh.indices) {
-                    Vertex vertex = {};
-
-                    vertex.pos = {
-                        attrib.vertices[3 * index.vertex_index + 0],
-                        attrib.vertices[3 * index.vertex_index + 1],
-                        attrib.vertices[3 * index.vertex_index + 2]
-                    };
-
-                    vertex.texCoord = {
-                        attrib.texcoords[2 * index.texcoord_index + 0],
-                        1.0f - attrib.texcoords[2 * index.texcoord_index + 1]
-                    };
-
-                    vertex.color = {1.0f, 1.0f, 1.0f};
-
-                    if (uniqueVertices.count(vertex) == 0) {
-                        uniqueVertices[vertex] = static_cast<uint32_t>(vertices.size());
-                        vertices.push_back(vertex);
-                    }
-
-                    indices.push_back(uniqueVertices[vertex]);
-                }
-            }
-        }
-    */
     void createVertexBuffer()
     {
         vertices = meshes[0].vertices; // Added this.
