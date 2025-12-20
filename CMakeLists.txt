@@ -26,5 +26,5 @@ endif()
 find_package(Vulkan REQUIRED)
 
 # 添加src目录
-add_subdirectory(vulkan-engine)
+add_subdirectory(src)
 

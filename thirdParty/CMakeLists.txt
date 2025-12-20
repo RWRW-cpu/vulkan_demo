@@ -19,8 +19,8 @@ set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "")
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "")
 set(GLFW_BUILD_DOCS OFF CACHE BOOL "")
 set(GLFW_INSTALL OFF CACHE BOOL "")
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/glfw)
-set_target_properties(glfw PROPERTIES FOLDER "thirdParty" POSITION_INDEPENDENT_CODE ON)
+add_subdirectory(glfw)
+# set_target_properties(glfw PROPERTIES FOLDER "thirdParty" POSITION_INDEPENDENT_CODE ON)
 
 
 # stbimage
