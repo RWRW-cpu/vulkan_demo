@@ -30,8 +30,8 @@ const int WIDTH = 1000;
 const int HEIGHT = 500;
 
 // 使用相对于可执行文件的路径
-const std::string MODEL_PATH = "D:/code/w_cplus/engine/Hedge/external/bullet/examples/pybullet/gym/pybullet_data/random_urdfs/003/003.obj";
-const std::string TEXTURE_PATH = "textures/globe.jpg";
+const std::string MODEL_PATH ="assets/duck.fbx";
+const std::string TEXTURE_PATH = "assets/duckCM.tga";
 
 const std::vector<const char*> validationLayers = {"VK_LAYER_LUNARG_standard_validation"};
 
@@ -160,6 +160,13 @@ struct UniformBufferObject
 
 class HelloTriangleApplication
 {
+public:
+    // 添加包围盒相关变量
+    glm::vec3 boundingBoxMin = glm::vec3(std::numeric_limits<float>::max());
+    glm::vec3 boundingBoxMax = glm::vec3(std::numeric_limits<float>::lowest());
+    glm::vec3 boundingBoxCenter = glm::vec3(0.0f);
+    float boundingBoxSize = 0.0f;
+
 public:
     void run()
     {
@@ -1235,6 +1242,27 @@ private:
         }
     }
 
+    void calculateBoundingBox()
+    {
+        // 重置包围盒
+        boundingBoxMin = glm::vec3(std::numeric_limits<float>::max());
+        boundingBoxMax = glm::vec3(std::numeric_limits<float>::lowest());
+
+        // 遍历所有网格的顶点计算包围盒
+        for (const auto& mesh : meshes)
+        {
+            for (const auto& vertex : mesh.vertices)
+            {
+                boundingBoxMin = glm::min(boundingBoxMin, vertex.pos);
+                boundingBoxMax = glm::max(boundingBoxMax, vertex.pos);
+            }
+        }
+
+        // 计算包围盒中心和大小
+        boundingBoxCenter = (boundingBoxMin + boundingBoxMax) * 0.5f;
+        boundingBoxSize = glm::length(boundingBoxMax - boundingBoxMin);
+    }
+
     void loadModel()
     {
         Assimp::Importer importer;
@@ -1248,7 +1276,14 @@ private:
             return;
         }
         processNode(scene->mRootNode, scene);
+
+        // 计算包围盒
+        calculateBoundingBox();
+
         std::cout << "模型加载成功，网格数量: " << meshes.size() << std::endl;
+        std::cout << "包围盒中心: (" << boundingBoxCenter.x << ", " << boundingBoxCenter.y << ", "
+                  << boundingBoxCenter.z << ")" << std::endl;
+        std::cout << "包围盒大小: " << boundingBoxSize << std::endl;
     }
 
     void createVertexBuffer()
@@ -1597,15 +1632,25 @@ private:
         UniformBufferObject ubo = {};
         ubo.model =
             glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+
+        // 自动计算相机位置，使其对准包围盒中心
+        float cameraDistance = boundingBoxSize * 2.0f;   // 根据包围盒大小调整距离
+        cameraDistance = std::max(cameraDistance, 1.0f); // 最小距离限制
+
+        glm::vec3 cameraPosition = boundingBoxCenter + glm::vec3(0.0f, 0.0f, cameraDistance);
+
         ubo.view = glm::lookAt(
-            glm::vec3(3.0f, 2.0f, 3.0f),
-            glm::vec3(0.0f, 0.0f, 0.0f),
-            glm::vec3(0.0f, 1.0f, 0.0f));
+            cameraPosition,             // 相机位置
+            boundingBoxCenter,          // 看向包围盒中心
+            glm::vec3(0.0f, 1.0f, 0.0f) // 上方向
+        );
+
         ubo.proj = glm::perspective(
             glm::radians(45.0f),
             swapChainExtent.width / (float)swapChainExtent.height,
             0.1f,
-            100.0f);
+            cameraDistance * 10.0f // 根据相机距离调整远平面
+        );
         ubo.proj[1][1] *= -1;
 
         void* data;
