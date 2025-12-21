@@ -1,9 +1,9 @@
 
-add_executable(vulkan-engine 
+add_executable(vk-base
     main.cpp)
 
-target_include_directories(vulkan-engine PUBLIC ${CMAKE_SOURCE_DIR})
-target_link_libraries(vulkan-engine 
+target_include_directories(vk-base PUBLIC ${CMAKE_SOURCE_DIR})
+target_link_libraries(vk-base 
     PRIVATE
     glm  
     stb_image 
@@ -12,7 +12,7 @@ target_link_libraries(vulkan-engine
     assimp)
 
 
-install(TARGETS vulkan-engine 
+install(TARGETS vk-base 
     RUNTIME DESTINATION bin
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib)
