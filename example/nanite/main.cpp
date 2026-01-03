@@ -642,6 +642,10 @@ struct UniformBufferObject
     glm::mat4 proj;
 };
 
+struct MeshPushConstants {
+    glm::mat4 model;
+};
+
 class HelloTriangleApplication
 {
 public:
@@ -1310,10 +1314,17 @@ private:
         colorBlending.blendConstants[2] = 0.0f;
         colorBlending.blendConstants[3] = 0.0f;
 
+        VkPushConstantRange pushConstantRange = {};
+        pushConstantRange.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+        pushConstantRange.offset = 0;
+        pushConstantRange.size = sizeof(MeshPushConstants);
+
         VkPipelineLayoutCreateInfo pipelineLayoutInfo = {};
         pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
         pipelineLayoutInfo.setLayoutCount = 1;
         pipelineLayoutInfo.pSetLayouts = &descriptorSetLayout;
+        pipelineLayoutInfo.pushConstantRangeCount = 1;
+        pipelineLayoutInfo.pPushConstantRanges = &pushConstantRange;
 
         if (vkCreatePipelineLayout(device, &pipelineLayoutInfo, nullptr, &pipelineLayout) !=
             VK_SUCCESS)
@@ -2158,11 +2169,19 @@ private:
             0,
             nullptr);
 
-        if (activeMeshlets.empty()) {
-            vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
-        } else {
-            for (const auto& m : activeMeshlets) {
-                vkCmdDrawIndexed(commandBuffers[i], (uint32_t)m->indices.size(), 1, m->indexOffset, 0, 0);
+        for (int x = 0; x < 10; x++) {
+            for (int y = 0; y < 10; y++) {
+                MeshPushConstants constants;
+                constants.model = glm::translate(glm::mat4(1.0f), glm::vec3(x * 200.0f, 0.0f, y * 200.0f));
+                vkCmdPushConstants(commandBuffers[i], pipelineLayout, VK_SHADER_STAGE_VERTEX_BIT, 0, sizeof(MeshPushConstants), &constants);
+
+                if (activeMeshlets.empty()) {
+                    vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+                } else {
+                    for (const auto& m : activeMeshlets) {
+                        vkCmdDrawIndexed(commandBuffers[i], (uint32_t)m->indices.size(), 1, m->indexOffset, 0, 0);
+                    }
+                }
             }
         }
 
