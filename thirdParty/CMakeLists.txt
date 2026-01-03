@@ -30,3 +30,14 @@ add_library(stb_image STATIC "${STB_IMAGE_DIR}/stb_image.h"
     "${STB_IMAGE_DIR}/stb_image.cpp")
 target_include_directories(stb_image PUBLIC ${STB_IMAGE_DIR})
 set_target_properties(stb_image PROPERTIES FOLDER "thirdParty" POSITION_INDEPENDENT_CODE ON)
+
+# meshoptimizer
+add_subdirectory(meshoptimizer)
+
+# METIS
+add_library(metis STATIC IMPORTED GLOBAL)
+target_include_directories(metis INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/metis/include)
+set_target_properties(metis PROPERTIES IMPORTED_LOCATION ${CMAKE_CURRENT_SOURCE_DIR}/metis/lib/metis.lib)
+set_target_properties(metis PROPERTIES IMPORTED_IMPLIB  ${CMAKE_CURRENT_SOURCE_DIR}/metis/lib/metis.lib)
+
+

@@ -25,6 +25,545 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <vector>
+#include <meshoptimizer.h>
+#include <metis.h>
+#include <map>
+#include <numeric>
+#include <random>
+#include <memory>
+#include <limits>
+
+struct Vertex
+{
+    glm::vec3 pos;
+    glm::vec3 color;
+    glm::vec2 texCoord;
+
+    static VkVertexInputBindingDescription getBindingDescription()
+    {
+        VkVertexInputBindingDescription bindingDescription = {};
+        bindingDescription.binding = 0;
+        bindingDescription.stride = sizeof(Vertex);
+        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
+
+        return bindingDescription;
+    }
+
+    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions()
+    {
+        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = {};
+
+        attributeDescriptions[0].binding = 0;
+        attributeDescriptions[0].location = 0;
+        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[0].offset = offsetof(Vertex, pos);
+
+        attributeDescriptions[1].binding = 0;
+        attributeDescriptions[1].location = 1;
+        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[1].offset = offsetof(Vertex, color);
+
+        attributeDescriptions[2].binding = 0;
+        attributeDescriptions[2].location = 2;
+        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
+        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
+        return attributeDescriptions;
+    }
+
+    bool operator==(const Vertex& other) const
+    {
+        return pos == other.pos && color == other.color && texCoord == other.texCoord;
+    }
+};
+
+namespace std
+{
+template <>
+struct hash<Vertex>
+{
+    size_t operator()(Vertex const& vertex) const
+    {
+        return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
+               (hash<glm::vec2>()(vertex.texCoord) << 1);
+    }
+};
+} // namespace std
+
+namespace Nanite {
+
+struct Edge {
+    uint32_t from;
+    uint32_t to;
+
+    bool operator==(const Edge& other) const {
+        return from == other.from && to == other.to;
+    }
+    
+    bool operator<(const Edge& other) const {
+        if (from != other.from) return from < other.from;
+        return to < other.to;
+    }
+};
+
+struct BoundingVolume {
+    glm::vec3 center;
+    float radius;
+    glm::vec3 min;
+    glm::vec3 max;
+};
+
+struct Meshlet;
+using MeshletPtr = std::shared_ptr<Meshlet>;
+using MeshletWeakPtr = std::weak_ptr<Meshlet>;
+
+struct Meshlet {
+    std::vector<Vertex> vertices;
+    std::vector<uint32_t> indices;
+    
+    uint32_t id;
+    int lod = 0;
+    float clusterError = 0.0f;
+    float parentError = std::numeric_limits<float>::infinity();
+    BoundingVolume boundingVolume;
+    BoundingVolume parentBoundingVolume;
+    
+    std::vector<MeshletWeakPtr> children; // Points to coarser meshlet (Parent in tree)
+    std::vector<MeshletPtr> parents;      // Points to finer meshlets (Children in tree)
+    
+    std::vector<Edge> boundaryEdges;
+
+    uint32_t vertexOffset = 0;
+    uint32_t indexOffset = 0;
+
+    Meshlet(const std::vector<Vertex>& verts, const std::vector<uint32_t>& inds) 
+        : vertices(verts), indices(inds) {
+        static std::mt19937 rng(0);
+        static std::uniform_int_distribution<uint32_t> dist(0, 10000000);
+        id = dist(rng);
+        
+        computeBoundaryEdges();
+        computeBoundingVolume();
+    }
+
+    void computeBoundaryEdges() {
+        std::map<Edge, int> edgeCounts;
+        for (size_t i = 0; i < indices.size(); i += 3) {
+            uint32_t a = indices[i];
+            uint32_t b = indices[i+1];
+            uint32_t c = indices[i+2];
+            
+            Edge e1 = {std::min(a, b), std::max(a, b)};
+            Edge e2 = {std::min(b, c), std::max(b, c)};
+            Edge e3 = {std::min(c, a), std::max(c, a)};
+            
+            edgeCounts[e1]++;
+            edgeCounts[e2]++;
+            edgeCounts[e3]++;
+        }
+        
+        boundaryEdges.clear();
+        for (auto const& [edge, count] : edgeCounts) {
+            if (count == 1) {
+                boundaryEdges.push_back(edge);
+            }
+        }
+    }
+
+    void computeBoundingVolume() {
+        if (vertices.empty()) return;
+        
+        glm::vec3 min(std::numeric_limits<float>::max());
+        glm::vec3 max(std::numeric_limits<float>::lowest());
+        glm::vec3 center(0.0f);
+        
+        size_t numVerts = vertices.size();
+        for (const auto& v : vertices) {
+            min = glm::min(min, v.pos);
+            max = glm::max(max, v.pos);
+            center += v.pos;
+        }
+        center /= (float)numVerts;
+        
+        float maxDistSq = 0.0f;
+        for (const auto& v : vertices) {
+            float distSq = glm::dot(center - v.pos, center - v.pos);
+            maxDistSq = std::max(maxDistSq, distSq);
+        }
+        
+        boundingVolume.center = center;
+        boundingVolume.radius = std::sqrt(maxDistSq);
+        boundingVolume.min = min;
+        boundingVolume.max = max;
+    }
+    
+    glm::vec3 getVertex(uint32_t index) const {
+        return vertices[index].pos;
+    }
+};
+
+std::vector<MeshletPtr> buildMeshlets(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices) {
+    size_t max_vertices = 255;
+    size_t max_triangles = 128;
+    float cone_weight = 0.0f;
+    
+    size_t max_meshlets = meshopt_buildMeshletsBound(indices.size(), max_vertices, max_triangles);
+    
+    std::vector<meshopt_Meshlet> meshlets(max_meshlets);
+    std::vector<unsigned int> meshlet_vertices(max_meshlets * max_vertices);
+    std::vector<unsigned char> meshlet_triangles(max_meshlets * max_triangles * 3);
+    
+    size_t meshlet_count = meshopt_buildMeshlets(
+        meshlets.data(),
+        meshlet_vertices.data(),
+        meshlet_triangles.data(),
+        indices.data(),
+        indices.size(),
+        &vertices[0].pos.x,
+        vertices.size(),
+        sizeof(Vertex),
+        max_vertices,
+        max_triangles,
+        cone_weight
+    );
+    
+    std::vector<MeshletPtr> result;
+    static std::mt19937 rng(1337);
+    std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+
+    for (size_t i = 0; i < meshlet_count; ++i) {
+        const auto& m = meshlets[i];
+        
+        std::vector<Vertex> m_vertices;
+        std::vector<uint32_t> m_indices;
+        
+        glm::vec3 meshletColor(dist(rng), dist(rng), dist(rng));
+
+        for (size_t v = 0; v < m.vertex_count; ++v) {
+            unsigned int original_index = meshlet_vertices[m.vertex_offset + v];
+            Vertex vtx = vertices[original_index];
+            vtx.color = meshletColor;
+            m_vertices.push_back(vtx);
+        }
+        
+        for (size_t t = 0; t < m.triangle_count; ++t) {
+            m_indices.push_back(meshlet_triangles[m.triangle_offset + t * 3 + 0]);
+            m_indices.push_back(meshlet_triangles[m.triangle_offset + t * 3 + 1]);
+            m_indices.push_back(meshlet_triangles[m.triangle_offset + t * 3 + 2]);
+        }
+        
+        result.push_back(std::make_shared<Meshlet>(m_vertices, m_indices));
+    }
+    
+    return result;
+}
+
+std::vector<std::vector<MeshletPtr>> groupMeshlets(std::vector<MeshletPtr>& meshlets) {
+    using EdgeVerts = std::pair<glm::vec3, glm::vec3>;
+    
+    auto make_edge_key = [](const glm::vec3& v1, const glm::vec3& v2) {
+        if (v1.x < v2.x || (v1.x == v2.x && (v1.y < v2.y || (v1.y == v2.y && v1.z < v2.z)))) {
+            return std::make_pair(v1, v2);
+        }
+        return std::make_pair(v2, v1);
+    };
+    
+    struct EdgeCmp {
+        bool operator()(const EdgeVerts& a, const EdgeVerts& b) const {
+            auto vec3_less = [](const glm::vec3& v1, const glm::vec3& v2) {
+                 if (v1.x != v2.x) return v1.x < v2.x;
+                 if (v1.y != v2.y) return v1.y < v2.y;
+                 return v1.z < v2.z;
+            };
+            if (vec3_less(a.first, b.first)) return true;
+            if (vec3_less(b.first, a.first)) return false;
+            return vec3_less(a.second, b.second);
+        }
+    };
+    
+    std::map<EdgeVerts, std::vector<int>, EdgeCmp> edgeToMeshlets;
+    
+    for (int i = 0; i < meshlets.size(); ++i) {
+        auto& m = meshlets[i];
+        for (const auto& edge : m->boundaryEdges) {
+            glm::vec3 v1 = m->getVertex(edge.from);
+            glm::vec3 v2 = m->getVertex(edge.to);
+            edgeToMeshlets[make_edge_key(v1, v2)].push_back(i);
+        }
+    }
+    
+    std::vector<std::set<int>> adjacency(meshlets.size());
+    for (auto& [edge, indices] : edgeToMeshlets) {
+        for (size_t i = 0; i < indices.size(); ++i) {
+            for (size_t j = i + 1; j < indices.size(); ++j) {
+                adjacency[indices[i]].insert(indices[j]);
+                adjacency[indices[j]].insert(indices[i]);
+            }
+        }
+    }
+    
+    std::vector<idx_t> xadj;
+    std::vector<idx_t> adjncy;
+    
+    xadj.push_back(0);
+    for (const auto& adj : adjacency) {
+        for (int neighbor : adj) {
+            adjncy.push_back(neighbor);
+        }
+        xadj.push_back(adjncy.size());
+    }
+    
+    idx_t nparts = (idx_t)std::ceil(meshlets.size() / 4.0);
+    if (nparts < 1) nparts = 1;
+    
+    if (nparts == 1 || meshlets.size() < nparts) {
+         return {meshlets};
+    }
+
+    idx_t nvtxs = (idx_t)meshlets.size();
+    idx_t ncon = 1;
+    std::vector<idx_t> part(nvtxs);
+    idx_t objval;
+    
+    idx_t options[METIS_NOPTIONS];
+    METIS_SetDefaultOptions(options);
+    options[METIS_OPTION_OBJTYPE] = METIS_OBJTYPE_CUT;
+    options[METIS_OPTION_CCORDER] = 1;
+    
+    int ret = METIS_PartGraphKway(&nvtxs, &ncon, xadj.data(), adjncy.data(), 
+                                  NULL, NULL, NULL, &nparts, NULL, NULL, options, &objval, part.data());
+                                  
+    if (ret != METIS_OK) {
+        std::cerr << "METIS failed" << std::endl;
+        return {meshlets};
+    }
+    
+    std::vector<std::vector<MeshletPtr>> groups(nparts);
+    for (int i = 0; i < nvtxs; ++i) {
+        groups[part[i]].push_back(meshlets[i]);
+    }
+    
+    std::vector<std::vector<MeshletPtr>> result;
+    for(auto& g : groups) {
+        if(!g.empty()) result.push_back(g);
+    }
+    return result;
+}
+
+MeshletPtr mergeMeshlets(const std::vector<MeshletPtr>& group) {
+    std::vector<Vertex> merged_vertices;
+    std::vector<uint32_t> merged_indices;
+    
+    for (const auto& m : group) {
+        uint32_t base_index = (uint32_t)merged_vertices.size();
+        merged_vertices.insert(merged_vertices.end(), m->vertices.begin(), m->vertices.end());
+        for (uint32_t idx : m->indices) {
+            merged_indices.push_back(base_index + idx);
+        }
+    }
+    
+    size_t vertex_count = merged_vertices.size();
+    std::vector<unsigned int> remap_table(vertex_count);
+    size_t unique_vertex_count = meshopt_generateVertexRemap(
+        remap_table.data(),
+        NULL,
+        vertex_count,
+        &merged_vertices[0].pos.x,
+        vertex_count,
+        sizeof(Vertex)
+    );
+    
+    std::vector<Vertex> new_vertices(unique_vertex_count);
+    std::vector<uint32_t> new_indices(merged_indices.size());
+    
+    meshopt_remapVertexBuffer(
+        new_vertices.data(),
+        merged_vertices.data(),
+        vertex_count,
+        sizeof(Vertex),
+        remap_table.data()
+    );
+    
+    meshopt_remapIndexBuffer(
+        new_indices.data(),
+        merged_indices.data(),
+        merged_indices.size(),
+        remap_table.data()
+    );
+    
+    return std::make_shared<Meshlet>(new_vertices, new_indices);
+}
+
+struct SimplificationResult {
+    float result_error;
+    MeshletPtr meshlet;
+};
+
+SimplificationResult simplifyMeshlet(MeshletPtr meshlet, size_t target_index_count) {
+    std::vector<uint32_t> destination(meshlet->indices.size());
+    float result_error = 0.0f;
+    
+    size_t simplified_index_count = meshopt_simplify(
+        destination.data(),
+        meshlet->indices.data(),
+        meshlet->indices.size(),
+        &meshlet->vertices[0].pos.x,
+        meshlet->vertices.size(),
+        sizeof(Vertex),
+        target_index_count,
+        0.05f,
+        meshopt_SimplifyLockBorder,
+        &result_error
+    );
+    
+    destination.resize(simplified_index_count);
+    
+    std::vector<unsigned int> remap(meshlet->vertices.size());
+    size_t unique_vertices = meshopt_optimizeVertexFetchRemap(
+        remap.data(),
+        destination.data(),
+        destination.size(),
+        meshlet->vertices.size()
+    );
+    
+    std::vector<Vertex> new_vertices(unique_vertices);
+    std::vector<uint32_t> new_indices(destination.size());
+    
+    meshopt_remapVertexBuffer(
+        new_vertices.data(),
+        meshlet->vertices.data(),
+        meshlet->vertices.size(),
+        sizeof(Vertex),
+        remap.data()
+    );
+    
+    meshopt_remapIndexBuffer(
+        new_indices.data(),
+        destination.data(),
+        destination.size(),
+        remap.data()
+    );
+    
+    auto new_meshlet = std::make_shared<Meshlet>(new_vertices, new_indices);
+    return {result_error, new_meshlet};
+}
+
+float scaleError(MeshletPtr meshlet) {
+    return meshopt_simplifyScale(
+        &meshlet->vertices[0].pos.x,
+        meshlet->vertices.size(),
+        sizeof(Vertex)
+    );
+}
+
+struct ProcessResult {
+    std::vector<MeshletPtr> allMeshlets;
+    MeshletPtr rootMeshlet;
+};
+
+ProcessResult process(const std::vector<Vertex>& vertices, const std::vector<uint32_t>& indices) {
+    auto meshlets = buildMeshlets(vertices, indices);
+    std::cout << "Initial meshlets: " << meshlets.size() << std::endl;
+    
+    std::map<uint32_t, MeshletPtr> previousMeshlets;
+    for(auto& m : meshlets) previousMeshlets[m->id] = m;
+    
+    auto calculateChildrenError = [&](const std::vector<MeshletPtr>& group) {
+        float childrenError = 0.0f;
+        for (auto& m : group) {
+            if (previousMeshlets.find(m->id) == previousMeshlets.end()) {
+                throw std::runtime_error("Could not find previous meshlet");
+            }
+            childrenError = std::max(childrenError, previousMeshlets[m->id]->clusterError);
+        }
+        return childrenError;
+    };
+    
+    auto updateParentErrors = [&](const std::vector<MeshletPtr>& group, float meshSpaceError, const BoundingVolume& boundingVolume) {
+        for (auto& m : group) {
+            previousMeshlets[m->id]->parentError = meshSpaceError;
+            previousMeshlets[m->id]->parentBoundingVolume = boundingVolume;
+        }
+    };
+    
+    auto updateMeshletRelationships = [&](const std::vector<MeshletPtr>& group, MeshletPtr parent, int lod) {
+        for (auto& m : group) {
+            m->children.push_back(parent);
+            m->lod = lod;
+        }
+        parent->parents.insert(parent->parents.end(), group.begin(), group.end());
+    };
+    
+    auto appendMeshlets = [&](MeshletPtr simplifiedGroup, const BoundingVolume& bounds, float error) {
+        auto split = buildMeshlets(simplifiedGroup->vertices, simplifiedGroup->indices);
+        for (auto& s : split) {
+            s->clusterError = error;
+            s->boundingVolume = bounds;
+        }
+        return split;
+    };
+    
+    int maxLOD = 100;
+    std::vector<MeshletPtr> inputs = meshlets;
+    MeshletPtr rootMeshlet = nullptr;
+    
+    for (int lod = 0; lod < maxLOD; ++lod) {
+        if (inputs.size() <= 1) {
+            if (!inputs.empty()) {
+                rootMeshlet = inputs[0];
+                rootMeshlet->lod = lod + 1;
+                rootMeshlet->parentBoundingVolume = rootMeshlet->boundingVolume;
+            }
+            break;
+        }
+        
+        auto grouped = groupMeshlets(inputs);
+        std::vector<MeshletPtr> splitOutputs;
+        
+        for (auto& group : grouped) {
+            auto mergedGroup = mergeMeshlets(group);
+            
+            auto simplified = simplifyMeshlet(mergedGroup, mergedGroup->indices.size() / 2);
+            
+            float localScale = scaleError(simplified.meshlet);
+            float meshSpaceError = simplified.result_error * localScale + calculateChildrenError(group);
+            
+            updateParentErrors(group, meshSpaceError, simplified.meshlet->boundingVolume);
+            
+            auto out = appendMeshlets(simplified.meshlet, simplified.meshlet->boundingVolume, meshSpaceError);
+            
+            for (auto& o : out) {
+                previousMeshlets[o->id] = o;
+                splitOutputs.push_back(o);
+                updateMeshletRelationships(group, o, lod);
+            }
+        }
+        
+        inputs = splitOutputs;
+        std::cout << "LOD " << lod << " complete. Inputs: " << inputs.size() << std::endl;
+    }
+    
+    std::cout << "Root meshlet found." << std::endl;
+    
+    std::vector<MeshletPtr> allMeshlets;
+    std::set<uint32_t> visited;
+    
+    std::function<void(MeshletPtr)> traverse = [&](MeshletPtr m) {
+        if (visited.count(m->id)) return;
+        visited.insert(m->id);
+        allMeshlets.push_back(m);
+        for (auto& child : m->parents) {
+            traverse(child);
+        }
+    };
+    
+    if (rootMeshlet) traverse(rootMeshlet);
+    std::cout << "Total meshlets: " << allMeshlets.size() << std::endl;
+
+    return {allMeshlets, rootMeshlet};
+}
+
+} // namespace Nanite
 
 const int WIDTH = 1000;
 const int HEIGHT = 500;
@@ -94,62 +633,7 @@ struct SwapChainSupportDetails
     std::vector<VkPresentModeKHR> presentModes;
 };
 
-struct Vertex
-{
-    glm::vec3 pos;
-    glm::vec3 color;
-    glm::vec2 texCoord;
-
-    static VkVertexInputBindingDescription getBindingDescription()
-    {
-        VkVertexInputBindingDescription bindingDescription = {};
-        bindingDescription.binding = 0;
-        bindingDescription.stride = sizeof(Vertex);
-        bindingDescription.inputRate = VK_VERTEX_INPUT_RATE_VERTEX;
-
-        return bindingDescription;
-    }
-
-    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions()
-    {
-        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = {};
-
-        attributeDescriptions[0].binding = 0;
-        attributeDescriptions[0].location = 0;
-        attributeDescriptions[0].format = VK_FORMAT_R32G32B32_SFLOAT;
-        attributeDescriptions[0].offset = offsetof(Vertex, pos);
-
-        attributeDescriptions[1].binding = 0;
-        attributeDescriptions[1].location = 1;
-        attributeDescriptions[1].format = VK_FORMAT_R32G32B32_SFLOAT;
-        attributeDescriptions[1].offset = offsetof(Vertex, color);
-
-        attributeDescriptions[2].binding = 0;
-        attributeDescriptions[2].location = 2;
-        attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
-        attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
-
-        return attributeDescriptions;
-    }
-
-    bool operator==(const Vertex& other) const
-    {
-        return pos == other.pos && color == other.color && texCoord == other.texCoord;
-    }
-};
-
-namespace std
-{
-template <>
-struct hash<Vertex>
-{
-    size_t operator()(Vertex const& vertex) const
-    {
-        return ((hash<glm::vec3>()(vertex.pos) ^ (hash<glm::vec3>()(vertex.color) << 1)) >> 1) ^
-               (hash<glm::vec2>()(vertex.texCoord) << 1);
-    }
-};
-} // namespace std
+#include "Control.h"
 
 struct UniformBufferObject
 {
@@ -166,6 +650,14 @@ public:
     glm::vec3 boundingBoxMax = glm::vec3(std::numeric_limits<float>::lowest());
     glm::vec3 boundingBoxCenter = glm::vec3(0.0f);
     float boundingBoxSize = 0.0f;
+
+    std::unique_ptr<Control> camera;
+    float lastFrame = 0.0f;
+
+    Nanite::ProcessResult naniteResult;
+    std::vector<Nanite::MeshletPtr> activeMeshlets;
+    std::set<uint32_t> visitedMeshlets;
+    float lodThreshold = 0.001f;
 
 public:
     void run()
@@ -240,6 +732,11 @@ private:
 
         glfwSetWindowUserPointer(window, this);
         glfwSetWindowSizeCallback(window, HelloTriangleApplication::onWindowResized);
+        glfwSetCursorPosCallback(window, HelloTriangleApplication::mouse_callback);
+        glfwSetScrollCallback(window, HelloTriangleApplication::scroll_callback);
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+
+        camera = std::make_unique<Control>(window, glm::vec3(0.0f, 0.0f, 3.0f));
     }
 
     void initVulkan()
@@ -261,6 +758,9 @@ private:
         createTextureImageView();    // 创建纹理图像视图
         createTextureSampler();      // 创建纹理采样器
         loadModel();                 // 加载模型
+
+
+
         createVertexBuffer();        // 创建顶点缓冲区
         createIndexBuffer();         // 创建索引缓冲区
         createUniformBuffer();       // 创建统一缓冲区
@@ -359,8 +859,40 @@ private:
         app->recreateSwapChain();
     }
 
+    static void mouse_callback(GLFWwindow* window, double xpos, double ypos)
+    {
+        HelloTriangleApplication* app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        if (app->camera->firstMouse)
+        {
+            app->camera->lastX = xpos;
+            app->camera->lastY = ypos;
+            app->camera->firstMouse = false;
+        }
+
+        float xoffset = xpos - app->camera->lastX;
+        float yoffset = app->camera->lastY - ypos; // reversed since y-coordinates go from bottom to top
+
+        app->camera->lastX = xpos;
+        app->camera->lastY = ypos;
+
+        app->camera->processMouseMovement(xoffset, yoffset);
+    }
+
+    static void scroll_callback(GLFWwindow* window, double xoffset, double yoffset)
+    {
+        HelloTriangleApplication* app = reinterpret_cast<HelloTriangleApplication*>(glfwGetWindowUserPointer(window));
+        app->camera->processMouseScroll(yoffset);
+    }
+
     void recreateSwapChain()
     {
+        int width = 0, height = 0;
+        glfwGetFramebufferSize(window, &width, &height);
+        while (width == 0 || height == 0) {
+            glfwGetFramebufferSize(window, &width, &height);
+            glfwWaitEvents();
+        }
+
         vkDeviceWaitIdle(device);
 
         cleanupSwapChain();
@@ -852,6 +1384,7 @@ private:
         VkCommandPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
         poolInfo.queueFamilyIndex = queueFamilyIndices.graphicsFamily;
+        poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
 
         if (vkCreateCommandPool(device, &poolInfo, nullptr, &commandPool) != VK_SUCCESS)
         {
@@ -1204,6 +1737,15 @@ private:
             vector.y = mesh->mVertices[i].y;
             vector.z = mesh->mVertices[i].z;
             vertex.pos = vector;
+            
+            if (mesh->HasVertexColors(0))
+            {
+                vertex.color = glm::vec3(mesh->mColors[0][i].r, mesh->mColors[0][i].g, mesh->mColors[0][i].b);
+            }
+            else
+            {
+                vertex.color = glm::vec3(1.0f, 1.0f, 1.0f);
+            }
 
             if (mesh->mTextureCoords[0])
             {
@@ -1277,8 +1819,19 @@ private:
         }
         processNode(scene->mRootNode, scene);
 
+        // Nanite processing
+        if (!meshes.empty()) {
+            std::cout << "Starting Nanite processing for mesh 0 with " << meshes[0].vertices.size() 
+                      << " vertices and " << meshes[0].indices.size() << " indices..." << std::endl;
+            naniteResult = Nanite::process(meshes[0].vertices, meshes[0].indices);
+        }
+
         // 计算包围盒
         calculateBoundingBox();
+
+
+        // Adjust camera to fit model
+        AdjustCamera();
 
         std::cout << "模型加载成功，网格数量: " << meshes.size() << std::endl;
         std::cout << "包围盒中心: (" << boundingBoxCenter.x << ", " << boundingBoxCenter.y << ", "
@@ -1286,15 +1839,28 @@ private:
         std::cout << "包围盒大小: " << boundingBoxSize << std::endl;
     }
 
+    void AdjustCamera()
+    {
+        float cameraDistance = boundingBoxSize * 1.5f;
+        cameraDistance = std::max(cameraDistance, 1.0f);
+        camera->position = boundingBoxCenter + glm::vec3(0.0f, 0.0f, cameraDistance);
+        camera->movementSpeed = boundingBoxSize * 0.5f; // Adjust speed based on scale
+    }
+
     void createVertexBuffer()
     {
-        vertices = meshes[0].vertices; // Added this.
-        std::cout << "顶点数: " << vertices.size() << std::endl;
-        if (vertices.size() > 0)
-        {
-            std::cout << "第一个顶点位置: (" << vertices[0].pos.x << ", " << vertices[0].pos.y
-                      << ", " << vertices[0].pos.z << ")" << std::endl;
+        std::vector<Vertex> allVertices;
+        for (auto& m : naniteResult.allMeshlets) {
+            m->vertexOffset = (uint32_t)allVertices.size();
+            allVertices.insert(allVertices.end(), m->vertices.begin(), m->vertices.end());
         }
+
+        if (allVertices.empty()) {
+            allVertices = meshes[0].vertices;
+        }
+        
+        vertices = allVertices;
+        std::cout << "Total Nanite vertices: " << vertices.size() << std::endl;
 
         VkDeviceSize bufferSize = sizeof(vertices[0]) * vertices.size();
 
@@ -1328,9 +1894,20 @@ private:
 
     void createIndexBuffer()
     {
-        indices = meshes[0].indices;
-        std::cout << "Number of meshes are: " << meshes.size() << std::endl;
-        std::cout << "索引数: " << indices.size() << std::endl;
+        std::vector<uint32_t> allIndices;
+        for (auto& m : naniteResult.allMeshlets) {
+            m->indexOffset = (uint32_t)allIndices.size();
+            for (uint32_t idx : m->indices) {
+                allIndices.push_back(m->vertexOffset + idx);
+            }
+        }
+
+        if (allIndices.empty()) {
+            allIndices = meshes[0].indices;
+        }
+
+        indices = allIndices;
+        std::cout << "Total Nanite indices: " << indices.size() << std::endl;
         VkDeviceSize bufferSize = sizeof(indices[0]) * indices.size();
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
@@ -1538,6 +2115,64 @@ private:
         throw std::runtime_error("failed to find suitable memory type!");
     }
 
+    void recordCommandBuffer(uint32_t i) {
+        VkCommandBufferBeginInfo beginInfo = {};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+
+        if (vkBeginCommandBuffer(commandBuffers[i], &beginInfo) != VK_SUCCESS) {
+            throw std::runtime_error("failed to begin recording command buffer!");
+        }
+
+        VkRenderPassBeginInfo renderPassInfo = {};
+        renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
+        renderPassInfo.renderPass = renderPass;
+        renderPassInfo.framebuffer = swapChainFramebuffers[i];
+        renderPassInfo.renderArea.offset = {0, 0};
+        renderPassInfo.renderArea.extent = swapChainExtent;
+
+        std::array<VkClearValue, 2> clearValues = {};
+        clearValues[0].color = {0.0f, 0.0f, 0.0f, 1.0f};
+        clearValues[1].depthStencil = {1.0f, 0};
+
+        renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
+        renderPassInfo.pClearValues = clearValues.data();
+
+        vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
+
+        vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
+
+        VkBuffer vertexBuffers[] = {vertexBuffer};
+        VkDeviceSize offsets[] = {0};
+        vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
+
+        vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT32);
+
+        vkCmdBindDescriptorSets(
+            commandBuffers[i],
+            VK_PIPELINE_BIND_POINT_GRAPHICS,
+            pipelineLayout,
+            0,
+            1,
+            &descriptorSet,
+            0,
+            nullptr);
+
+        if (activeMeshlets.empty()) {
+            vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
+        } else {
+            for (const auto& m : activeMeshlets) {
+                vkCmdDrawIndexed(commandBuffers[i], (uint32_t)m->indices.size(), 1, m->indexOffset, 0, 0);
+            }
+        }
+
+        vkCmdEndRenderPass(commandBuffers[i]);
+
+        if (vkEndCommandBuffer(commandBuffers[i]) != VK_SUCCESS) {
+            throw std::runtime_error("failed to record command buffer!");
+        }
+    }
+
     void createCommandBuffers()
     {
         commandBuffers.resize(swapChainFramebuffers.size());
@@ -1555,54 +2190,7 @@ private:
 
         for (size_t i = 0; i < commandBuffers.size(); i++)
         {
-            VkCommandBufferBeginInfo beginInfo = {};
-            beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
-
-            vkBeginCommandBuffer(commandBuffers[i], &beginInfo);
-
-            VkRenderPassBeginInfo renderPassInfo = {};
-            renderPassInfo.sType = VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO;
-            renderPassInfo.renderPass = renderPass;
-            renderPassInfo.framebuffer = swapChainFramebuffers[i];
-            renderPassInfo.renderArea.offset = {0, 0};
-            renderPassInfo.renderArea.extent = swapChainExtent;
-
-            std::array<VkClearValue, 2> clearValues = {};
-            clearValues[0].color = {0.0f, 0.0f, 0.0f, 1.0f};
-            clearValues[1].depthStencil = {1.0f, 0};
-
-            renderPassInfo.clearValueCount = static_cast<uint32_t>(clearValues.size());
-            renderPassInfo.pClearValues = clearValues.data();
-
-            vkCmdBeginRenderPass(commandBuffers[i], &renderPassInfo, VK_SUBPASS_CONTENTS_INLINE);
-
-            vkCmdBindPipeline(commandBuffers[i], VK_PIPELINE_BIND_POINT_GRAPHICS, graphicsPipeline);
-
-            VkBuffer vertexBuffers[] = {vertexBuffer};
-            VkDeviceSize offsets[] = {0};
-            vkCmdBindVertexBuffers(commandBuffers[i], 0, 1, vertexBuffers, offsets);
-
-            vkCmdBindIndexBuffer(commandBuffers[i], indexBuffer, 0, VK_INDEX_TYPE_UINT32);
-
-            vkCmdBindDescriptorSets(
-                commandBuffers[i],
-                VK_PIPELINE_BIND_POINT_GRAPHICS,
-                pipelineLayout,
-                0,
-                1,
-                &descriptorSet,
-                0,
-                nullptr);
-
-            vkCmdDrawIndexed(commandBuffers[i], static_cast<uint32_t>(indices.size()), 1, 0, 0, 0);
-
-            vkCmdEndRenderPass(commandBuffers[i]);
-
-            if (vkEndCommandBuffer(commandBuffers[i]) != VK_SUCCESS)
-            {
-                throw std::runtime_error("failed to record command buffer!");
-            }
+            recordCommandBuffer((uint32_t)i);
         }
     }
 
@@ -1620,6 +2208,22 @@ private:
         }
     }
 
+    void traverseLOD(Nanite::MeshletPtr m, const glm::vec3& cameraPos, float threshold) {
+        if (visitedMeshlets.count(m->id)) return;
+        visitedMeshlets.insert(m->id);
+
+        float dist = std::max(glm::distance(cameraPos, m->boundingVolume.center) - m->boundingVolume.radius, 0.0001f);
+        float projectedError = m->clusterError / dist;
+
+        if (projectedError <= threshold || m->parents.empty()) {
+            activeMeshlets.push_back(m);
+        } else {
+            for (auto& child : m->parents) {
+                traverseLOD(child, cameraPos, threshold);
+            }
+        }
+    }
+
     void updateUniformBuffer()
     {
         static auto startTime = std::chrono::high_resolution_clock::now();
@@ -1628,28 +2232,48 @@ private:
         float time =
             std::chrono::duration_cast<std::chrono::milliseconds>(currentTime - startTime).count() /
             1000.0f;
+        
+        float deltaTime = time - lastFrame;
+        lastFrame = time;
+
+        camera->processInput(deltaTime);
+
+        // LOD Selection
+        if (naniteResult.rootMeshlet) {
+            activeMeshlets.clear();
+            visitedMeshlets.clear();
+            traverseLOD(naniteResult.rootMeshlet, camera->position, lodThreshold);
+            
+            uint32_t activeVertexCount = 0;
+            uint32_t activeIndexCount = 0;
+            for (const auto& m : activeMeshlets) {
+                activeVertexCount += (uint32_t)m->vertices.size();
+                activeIndexCount += (uint32_t)m->indices.size();
+            }
+
+            static uint32_t lastVertexCount = 0;
+            if (activeVertexCount != lastVertexCount) {
+                std::cout << "Active Nanite - Vertices: " << activeVertexCount 
+                          << " | Indices: " << activeIndexCount 
+                          << " | Meshlets: " << activeMeshlets.size() << std::endl;
+                lastVertexCount = activeVertexCount;
+            }
+        }
 
         UniformBufferObject ubo = {};
-        ubo.model =
-            glm::rotate(glm::mat4(1.0f), time * glm::radians(90.0f), glm::vec3(0.0f, 1.0f, 0.0f));
+        ubo.model = glm::mat4(1.0f);
+        ubo.view = camera->getViewMatrix();
 
-        // 自动计算相机位置，使其对准包围盒中心
-        float cameraDistance = boundingBoxSize * 2.0f;   // 根据包围盒大小调整距离
-        cameraDistance = std::max(cameraDistance, 1.0f); // 最小距离限制
-
-        glm::vec3 cameraPosition = boundingBoxCenter + glm::vec3(0.0f, 0.0f, cameraDistance);
-
-        ubo.view = glm::lookAt(
-            cameraPosition,             // 相机位置
-            boundingBoxCenter,          // 看向包围盒中心
-            glm::vec3(0.0f, 1.0f, 0.0f) // 上方向
-        );
+        float aspect = swapChainExtent.width / (float)swapChainExtent.height;
+        if (std::isnan(aspect) || std::isinf(aspect) || aspect <= 0.0f) {
+            aspect = 1.0f;
+        }
 
         ubo.proj = glm::perspective(
-            glm::radians(45.0f),
-            swapChainExtent.width / (float)swapChainExtent.height,
+            glm::radians(camera->zoom),
+            aspect,
             0.1f,
-            cameraDistance * 10.0f // 根据相机距离调整远平面
+            10000.0f
         );
         ubo.proj[1][1] *= -1;
 
@@ -1679,6 +2303,8 @@ private:
         {
             throw std::runtime_error("failed to acquire swap chain image!");
         }
+
+        recordCommandBuffer(imageIndex);
 
         VkSubmitInfo submitInfo = {};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
