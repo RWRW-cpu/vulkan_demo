@@ -7,7 +7,10 @@
 #include <glm/glm.hpp>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtx/hash.hpp>
+#include <glm/gtx/quaternion.hpp>
+#include <glm/gtc/type_ptr.hpp>
 
+#define STBI_WINDOWS_UTF8
 #define STB_IMAGE_IMPLEMENTATION
 #include <stb_image.h>
 
@@ -28,10 +31,11 @@
 
 const int WIDTH = 1000;
 const int HEIGHT = 500;
+const int MAX_BONES = 100;
 
 // 使用相对于可执行文件的路径
-const std::string MODEL_PATH ="assets/duck.fbx";
-const std::string TEXTURE_PATH = "assets/duckCM.tga";
+const std::string MODEL_PATH ="./assets/hutao/hutao_multi2.fbx";
+const std::string TEXTURE_PATH = "./assets/hutao/tex/服.png";
 
 const std::vector<const char*> validationLayers = {"VK_LAYER_KHRONOS_validation"};
 
@@ -94,11 +98,40 @@ struct SwapChainSupportDetails
     std::vector<VkPresentModeKHR> presentModes;
 };
 
+#define MAX_BONE_INFLUENCE 4
+
+struct BoneInfo
+{
+    int id;
+    glm::mat4 offset;
+};
+
+struct KeyPosition
+{
+    glm::vec3 position;
+    float timeStamp;
+};
+
+struct KeyRotation
+{
+    glm::quat orientation;
+    float timeStamp;
+};
+
+struct KeyScale
+{
+    glm::vec3 scale;
+    float timeStamp;
+};
+
 struct Vertex
 {
     glm::vec3 pos;
     glm::vec3 color;
     glm::vec2 texCoord;
+    glm::vec3 normal;
+    int boneIDs[MAX_BONE_INFLUENCE];
+    float weights[MAX_BONE_INFLUENCE];
 
     static VkVertexInputBindingDescription getBindingDescription()
     {
@@ -110,9 +143,9 @@ struct Vertex
         return bindingDescription;
     }
 
-    static std::array<VkVertexInputAttributeDescription, 3> getAttributeDescriptions()
+    static std::array<VkVertexInputAttributeDescription, 6> getAttributeDescriptions()
     {
-        std::array<VkVertexInputAttributeDescription, 3> attributeDescriptions = {};
+        std::array<VkVertexInputAttributeDescription, 6> attributeDescriptions = {};
 
         attributeDescriptions[0].binding = 0;
         attributeDescriptions[0].location = 0;
@@ -128,6 +161,21 @@ struct Vertex
         attributeDescriptions[2].location = 2;
         attributeDescriptions[2].format = VK_FORMAT_R32G32_SFLOAT;
         attributeDescriptions[2].offset = offsetof(Vertex, texCoord);
+
+        attributeDescriptions[3].binding = 0;
+        attributeDescriptions[3].location = 3;
+        attributeDescriptions[3].format = VK_FORMAT_R32G32B32_SFLOAT;
+        attributeDescriptions[3].offset = offsetof(Vertex, normal);
+
+        attributeDescriptions[4].binding = 0;
+        attributeDescriptions[4].location = 4;
+        attributeDescriptions[4].format = VK_FORMAT_R32G32B32A32_SINT;
+        attributeDescriptions[4].offset = offsetof(Vertex, boneIDs);
+
+        attributeDescriptions[5].binding = 0;
+        attributeDescriptions[5].location = 5;
+        attributeDescriptions[5].format = VK_FORMAT_R32G32B32A32_SFLOAT;
+        attributeDescriptions[5].offset = offsetof(Vertex, weights);
 
         return attributeDescriptions;
     }
@@ -158,6 +206,168 @@ struct UniformBufferObject
     glm::mat4 proj;
 };
 
+// Bone transformation container
+class Bone
+{
+public:
+    Bone() = default;
+    Bone(const std::string &name, int ID, const aiNodeAnim *channel)
+        : m_Name(name), m_ID(ID), m_LocalTransform(1.0f)
+    {
+        m_NumPositions = channel->mNumPositionKeys;
+        for (int i = 0; i < m_NumPositions; ++i)
+        {
+            aiVector3D aiPosition = channel->mPositionKeys[i].mValue;
+            float timeStamp = channel->mPositionKeys[i].mTime;
+            m_Positions.push_back({glm::vec3(aiPosition.x, aiPosition.y, aiPosition.z), timeStamp});
+        }
+
+        m_NumRotations = channel->mNumRotationKeys;
+        for (int i = 0; i < m_NumRotations; ++i)
+        {
+            aiQuaternion aiOrientation = channel->mRotationKeys[i].mValue;
+            float timeStamp = channel->mRotationKeys[i].mTime;
+            m_Rotations.push_back({glm::quat(aiOrientation.w, aiOrientation.x, aiOrientation.y, aiOrientation.z), timeStamp});
+        }
+
+        m_NumScalings = channel->mNumScalingKeys;
+        for (int i = 0; i < m_NumScalings; ++i)
+        {
+            aiVector3D scale = channel->mScalingKeys[i].mValue;
+            float timeStamp = channel->mScalingKeys[i].mTime;
+            m_Scales.push_back({glm::vec3(scale.x, scale.y, scale.z), timeStamp});
+        }
+    }
+
+    void Update(float animationTime)
+    {
+        glm::mat4 translation = InterpolatePosition(animationTime);
+        glm::mat4 rotation = InterpolateRotation(animationTime);
+        glm::mat4 scale = InterpolateScaling(animationTime);
+        m_LocalTransform = translation * rotation * scale;
+    }
+
+    glm::mat4 GetLocalTransform() { return m_LocalTransform; }
+    std::string GetBoneName() const { return m_Name; }
+    int GetBoneID() { return m_ID; }
+
+private:
+    float GetScaleFactor(float lastTimeStamp, float nextTimeStamp, float animationTime)
+    {
+        return ((animationTime - lastTimeStamp) / (nextTimeStamp - lastTimeStamp));
+    }
+
+    glm::mat4 InterpolatePosition(float animationTime)
+    {
+        if (1 == m_NumPositions)
+            return glm::translate(glm::mat4(1.0f), m_Positions[0].position);
+
+        int pIndex = 0;
+        for (int i = 0; i < m_NumPositions - 1; ++i)
+        {
+            if (animationTime < m_Positions[i + 1].timeStamp)
+            {
+                pIndex = i;
+                break;
+            }
+        }
+
+        if ((pIndex == 0 && m_Positions[pIndex].timeStamp >= animationTime) || pIndex == m_NumPositions - 1)
+            return glm::translate(glm::mat4(1.0f), m_Positions[pIndex].position);
+
+        float scaleFactor = GetScaleFactor(m_Positions[pIndex].timeStamp, m_Positions[pIndex + 1].timeStamp, animationTime);
+        glm::vec3 finalPosition = glm::mix(m_Positions[pIndex].position, m_Positions[pIndex + 1].position, scaleFactor);
+
+        return glm::translate(glm::mat4(1.0f), finalPosition);
+    }
+
+    glm::mat4 InterpolateRotation(float animationTime)
+    {
+        if (1 == m_NumRotations)
+            return glm::mat4_cast(m_Rotations[0].orientation);
+
+        int pIndex = 0;
+        for (int i = 0; i < m_NumRotations - 1; ++i)
+        {
+            if (animationTime < m_Rotations[i + 1].timeStamp)
+            {
+                pIndex = i;
+                break;
+            }
+        }
+
+        if ((pIndex == 0 && m_Rotations[pIndex].timeStamp >= animationTime) || pIndex == m_NumRotations - 1)
+            return glm::mat4_cast(m_Rotations[pIndex].orientation);
+
+        float scaleFactor = GetScaleFactor(m_Rotations[pIndex].timeStamp, m_Rotations[pIndex + 1].timeStamp, animationTime);
+        glm::quat finalRotation = glm::slerp(m_Rotations[pIndex].orientation, m_Rotations[pIndex + 1].orientation, scaleFactor);
+
+        return glm::mat4_cast(finalRotation);
+    }
+
+    glm::mat4 InterpolateScaling(float animationTime)
+    {
+        if (1 == m_NumScalings)
+            return glm::scale(glm::mat4(1.0f), m_Scales[0].scale);
+
+        int pIndex = 0;
+        for (int i = 0; i < m_NumScalings - 1; ++i)
+        {
+            if (animationTime < m_Scales[i + 1].timeStamp)
+            {
+                pIndex = i;
+                break;
+            }
+        }
+
+        if ((pIndex == 0 && m_Scales[pIndex].timeStamp >= animationTime) || pIndex == m_NumScalings - 1)
+            return glm::scale(glm::mat4(1.0f), m_Scales[pIndex].scale);
+
+        float scaleFactor = GetScaleFactor(m_Scales[pIndex].timeStamp, m_Scales[pIndex + 1].timeStamp, animationTime);
+        glm::vec3 finalScale = glm::mix(m_Scales[pIndex].scale, m_Scales[pIndex + 1].scale, scaleFactor);
+
+        return glm::scale(glm::mat4(1.0f), finalScale);
+    }
+
+    std::vector<KeyPosition> m_Positions;
+    std::vector<KeyRotation> m_Rotations;
+    std::vector<KeyScale> m_Scales;
+
+    int m_NumPositions;
+    int m_NumRotations;
+    int m_NumScalings;
+
+    std::string m_Name;
+    int m_ID;
+    glm::mat4 m_LocalTransform;
+};
+
+typedef std::unordered_map<std::string, Bone> StringBoneMap;
+
+struct BoneNode
+{
+    glm::mat4 transformation;
+    std::string name;
+    int childrenCount;
+    std::vector<BoneNode> children;
+};
+
+// Animation clip structure
+struct Animation
+{
+    std::string m_Name;
+    float m_Duration;
+    int m_TicksPerSecond;
+    StringBoneMap m_BoneKeys;
+
+    Bone* FindBone(const std::string &name)
+    {
+        auto iter = m_BoneKeys.find(name);
+        if (iter != m_BoneKeys.end())
+            return &(iter->second);
+        return nullptr;
+    }
+};
 class Mesh
 {
 public:
@@ -170,17 +380,33 @@ public:
     }
 };
 
-
 class HelloTriangleApplication
 {
 public:
-    // 添加包围盒相关变量
+    std::vector<Mesh> m_meshes;
+
+    // Bounding box
     glm::vec3 m_boundingBoxMin = glm::vec3(std::numeric_limits<float>::max());
     glm::vec3 m_boundingBoxMax = glm::vec3(std::numeric_limits<float>::lowest());
     glm::vec3 m_boundingBoxCenter = glm::vec3(0.0f);
     float m_boundingBoxSize = 0.0f;
 
-    std::vector<Mesh> m_meshes;
+    // Animation system
+    std::vector<Animation> m_Animations;
+    std::vector<std::string> m_AnimationNames;
+    BoneNode m_RootBoneNode;
+    std::unordered_map<std::string, BoneInfo> m_BoneInfoMap;
+    int m_BoneCounter = 0;
+
+    Animation* m_CurrentAnimation = nullptr;
+    float m_CurrentTime = 0.0f;
+    int m_CurrentAnimationIndex = 0;
+    bool m_PlayAnimation = true;
+    float m_PlaySpeed = 1.0f;
+
+    std::vector<glm::mat4> m_FinalBoneMatrices;
+    VkBuffer m_BoneMatrixBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_BoneMatrixBufferMemory = VK_NULL_HANDLE;
 
 public:
     void run()
@@ -229,13 +455,13 @@ private:
 
     std::vector<Vertex> m_vertices;
     std::vector<uint32_t> m_indices;
-    VkBuffer m_vertexBuffer;
-    VkDeviceMemory m_vertexBufferMemory;
-    VkBuffer m_indexBuffer;
-    VkDeviceMemory m_indexBufferMemory;
+    VkBuffer m_vertexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_vertexBufferMemory = VK_NULL_HANDLE;
+    VkBuffer m_indexBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_indexBufferMemory = VK_NULL_HANDLE;
 
-    VkBuffer m_uniformBuffer;
-    VkDeviceMemory m_uniformBufferMemory;
+    VkBuffer m_uniformBuffer = VK_NULL_HANDLE;
+    VkDeviceMemory m_uniformBufferMemory = VK_NULL_HANDLE;
 
     VkDescriptorPool m_descriptorPool;
     VkDescriptorSet m_descriptorSet;
@@ -244,6 +470,8 @@ private:
 
     VkSemaphore m_imageAvailableSemaphore;
     VkSemaphore m_renderFinishedSemaphore;
+
+private:
 
     void initWindow()
     {
@@ -287,10 +515,17 @@ private:
 
     void mainLoop()
     {
+        auto lastTime = std::chrono::high_resolution_clock::now();
+        
         while (!glfwWindowShouldClose(m_window))
         {
             glfwPollEvents();
 
+            auto currentTime = std::chrono::high_resolution_clock::now();
+            float dt = std::chrono::duration<float>(currentTime - lastTime).count();
+            lastTime = currentTime;
+
+            UpdateAnimation(dt);
             updateUniformBuffer();
             drawFrame();
         }
@@ -342,6 +577,13 @@ private:
         vkDestroyDescriptorSetLayout(m_device, m_descriptorSetLayout, nullptr);
         vkDestroyBuffer(m_device, m_uniformBuffer, nullptr);
         vkFreeMemory(m_device, m_uniformBufferMemory, nullptr);
+
+        // Cleanup bone matrix buffer
+        if (m_BoneMatrixBuffer != VK_NULL_HANDLE)
+        {
+            vkDestroyBuffer(m_device, m_BoneMatrixBuffer, nullptr);
+            vkFreeMemory(m_device, m_BoneMatrixBufferMemory, nullptr);
+        }
 
         vkDestroyBuffer(m_device, m_indexBuffer, nullptr);
         vkFreeMemory(m_device, m_indexBufferMemory, nullptr);
@@ -681,9 +923,17 @@ private:
         samplerLayoutBinding.pImmutableSamplers = nullptr;
         samplerLayoutBinding.stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-        std::array<VkDescriptorSetLayoutBinding, 2> bindings = {
+        VkDescriptorSetLayoutBinding boneLayoutBinding = {};
+        boneLayoutBinding.binding = 2;
+        boneLayoutBinding.descriptorCount = 1;
+        boneLayoutBinding.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        boneLayoutBinding.pImmutableSamplers = nullptr;
+        boneLayoutBinding.stageFlags = VK_SHADER_STAGE_VERTEX_BIT;
+
+        std::array<VkDescriptorSetLayoutBinding, 3> bindings = {
             uboLayoutBinding,
-            samplerLayoutBinding};
+            samplerLayoutBinding,
+            boneLayoutBinding};
         VkDescriptorSetLayoutCreateInfo layoutInfo = {};
         layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
         layoutInfo.bindingCount = static_cast<uint32_t>(bindings.size());
@@ -698,8 +948,8 @@ private:
 
     void createGraphicsPipeline()
     {
-        auto vertShaderCode = readFile("shaders/vkBase_vert.spv");
-        auto fragShaderCode = readFile("shaders/vkBase_frag.spv");
+        auto vertShaderCode = readFile("shaders/vkAnim_vert.spv");
+        auto fragShaderCode = readFile("shaders/vkAnim_frag.spv");
 
         VkShaderModule vertShaderModule = createShaderModule(vertShaderCode);
         VkShaderModule fragShaderModule = createShaderModule(fragShaderCode);
@@ -1199,15 +1449,33 @@ private:
     {
         std::vector<Vertex> vertices;
         std::vector<unsigned int> indices;
+        
+        // Initialize vertices
         for (unsigned int i = 0; i < mesh->mNumVertices; i++)
         {
             Vertex vertex;
+            
+            // Position
             glm::vec3 vector;
             vector.x = mesh->mVertices[i].x;
             vector.y = mesh->mVertices[i].y;
             vector.z = mesh->mVertices[i].z;
             vertex.pos = vector;
 
+            // Normal
+            if (mesh->HasNormals())
+            {
+                vector.x = mesh->mNormals[i].x;
+                vector.y = mesh->mNormals[i].y;
+                vector.z = mesh->mNormals[i].z;
+                vertex.normal = vector;
+            }
+            else
+            {
+                vertex.normal = glm::vec3(0.0f, 1.0f, 0.0f);
+            }
+
+            // Texture Coordinates
             if (mesh->mTextureCoords[0])
             {
                 glm::vec2 vec;
@@ -1219,8 +1487,27 @@ private:
             {
                 vertex.texCoord = glm::vec2(0.0f, 0.0f);
             }
+
+            // Color (default white)
+            vertex.color = glm::vec3(1.0f, 1.0f, 1.0f);
+
+            // Initialize bone data
+            for (int j = 0; j < MAX_BONE_INFLUENCE; ++j)
+            {
+                vertex.boneIDs[j] = 0;
+                vertex.weights[j] = 0.0f;
+            }
+
             vertices.push_back(vertex);
         }
+
+        // Extract bone weights
+        if (mesh->HasBones())
+        {
+            ExtractBoneWeightForVertices(vertices, mesh);
+        }
+
+        // Collect face indices
         for (unsigned int i = 0; i < mesh->mNumFaces; i++)
         {
             aiFace face = mesh->mFaces[i];
@@ -1278,7 +1565,14 @@ private:
             std::cout << "ERROR::ASSIMP:: " << importer.GetErrorString() << std::endl;
             return;
         }
+        
+        // Load bone hierarchy
+        ReadHierarchyData(m_RootBoneNode, scene->mRootNode);
+        
         processNode(scene->mRootNode, scene);
+        
+        // Load animations
+        LoadAnimations(scene);
 
         // 计算包围盒
         calculateBoundingBox();
@@ -1287,12 +1581,204 @@ private:
         std::cout << "包围盒中心: (" << m_boundingBoxCenter.x << ", " << m_boundingBoxCenter.y << ", "
                   << m_boundingBoxCenter.z << ")" << std::endl;
         std::cout << "包围盒大小: " << m_boundingBoxSize << std::endl;
+        std::cout << "动画数量: " << m_Animations.size() << std::endl;
+        
+        // Initialize animation system
+        if (!m_Animations.empty())
+        {
+            m_CurrentAnimation = &m_Animations[0];
+            m_CurrentAnimationIndex = 0;
+            m_FinalBoneMatrices.resize(MAX_BONES, glm::mat4(1.0f));
+            
+            // Create bone matrix buffer (Host visible for easy updating)
+            VkDeviceSize bufferSize = sizeof(glm::mat4) * MAX_BONES;
+            createBuffer(
+                bufferSize,
+                VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                m_BoneMatrixBuffer,
+                m_BoneMatrixBufferMemory);
+        }
+    }
+
+    void ReadHierarchyData(BoneNode &dest, const aiNode *src)
+    {
+        if (!src) return;
+
+        dest.name = src->mName.data;
+        dest.transformation = aiMatrixToGlmMat4(src->mTransformation);
+        dest.childrenCount = src->mNumChildren;
+
+        for (unsigned int i = 0; i < src->mNumChildren; i++)
+        {
+            BoneNode newData;
+            ReadHierarchyData(newData, src->mChildren[i]);
+            dest.children.push_back(newData);
+        }
+    }
+
+    glm::mat4 aiMatrixToGlmMat4(const aiMatrix4x4& from)
+    {
+        glm::mat4 to;
+        to[0][0] = from.a1; to[1][0] = from.a2; to[2][0] = from.a3; to[3][0] = from.a4;
+        to[0][1] = from.b1; to[1][1] = from.b2; to[2][1] = from.b3; to[3][1] = from.b4;
+        to[0][2] = from.c1; to[1][2] = from.c2; to[2][2] = from.c3; to[3][2] = from.c4;
+        to[0][3] = from.d1; to[1][3] = from.d2; to[2][3] = from.d3; to[3][3] = from.d4;
+        return to;
+    }
+
+    void LoadAnimations(const aiScene* scene)
+    {
+        std::cout << "动画总数: " << scene->mNumAnimations << std::endl;
+        for (unsigned int i = 0; i < scene->mNumAnimations; ++i)
+        {
+            aiAnimation* aiAnim = scene->mAnimations[i];
+            Animation anim;
+            anim.m_Name = aiAnim->mName.data;
+            anim.m_Duration = aiAnim->mDuration;
+            anim.m_TicksPerSecond = aiAnim->mTicksPerSecond != 0 ? aiAnim->mTicksPerSecond : 1;
+
+            std::cout << "加载动画: " << anim.m_Name << " 持续时间: " << anim.m_Duration << " Ticks/Sec: " << anim.m_TicksPerSecond << std::endl;
+
+            for (unsigned int j = 0; j < aiAnim->mNumChannels; ++j)
+            {
+                aiNodeAnim* channel = aiAnim->mChannels[j];
+                std::string boneName = channel->mNodeName.data;
+
+                // Register bone if not already registered
+                if (m_BoneInfoMap.find(boneName) == m_BoneInfoMap.end())
+                {
+                    BoneInfo boneInfo;
+                    boneInfo.id = m_BoneCounter++;
+                    boneInfo.offset = glm::mat4(1.0f);
+                    m_BoneInfoMap[boneName] = boneInfo;
+                }
+
+                Bone bone(boneName, m_BoneInfoMap[boneName].id, channel);
+                anim.m_BoneKeys[boneName] = bone;
+            }
+
+            m_Animations.push_back(anim);
+            m_AnimationNames.push_back(anim.m_Name);
+        }
+    }
+
+    void UpdateAnimation(float dt)
+    {
+        if (!m_CurrentAnimation || m_Animations.empty())
+            return;
+
+        if (m_PlayAnimation)
+        {
+            m_CurrentTime += m_CurrentAnimation->m_TicksPerSecond * dt * m_PlaySpeed;
+            m_CurrentTime = fmod(m_CurrentTime, m_CurrentAnimation->m_Duration);
+        }
+
+        // Calculate bone transformations
+        CalculateBoneTransform(&m_RootBoneNode, glm::mat4(1.0f));
+
+        // Update bone matrix buffer
+        if (!m_FinalBoneMatrices.empty() && m_BoneMatrixBuffer != VK_NULL_HANDLE)
+        {
+            VkDeviceSize bufferSize = sizeof(glm::mat4) * MAX_BONES;
+            void* data;
+            vkMapMemory(m_device, m_BoneMatrixBufferMemory, 0, bufferSize, 0, &data);
+            memcpy(data, m_FinalBoneMatrices.data(), (size_t)bufferSize);
+            vkUnmapMemory(m_device, m_BoneMatrixBufferMemory);
+        }
+    }
+
+    void CalculateBoneTransform(const BoneNode* node, glm::mat4 parentTransform)
+    {
+        if (!node) return;
+
+        std::string nodeName = node->name;
+        glm::mat4 nodeTransform = node->transformation;
+
+        Bone* bone = m_CurrentAnimation->FindBone(nodeName);
+        if (bone)
+        {
+            bone->Update(m_CurrentTime);
+            nodeTransform = bone->GetLocalTransform();
+        }
+
+        glm::mat4 globalTransformation = parentTransform * nodeTransform;
+
+        if (m_BoneInfoMap.find(nodeName) != m_BoneInfoMap.end())
+        {
+            int boneIndex = m_BoneInfoMap[nodeName].id;
+            if (boneIndex >= 0 && boneIndex < static_cast<int>(m_FinalBoneMatrices.size()))
+            {
+                m_FinalBoneMatrices[boneIndex] = globalTransformation * m_BoneInfoMap[nodeName].offset;
+            }
+        }
+
+        for (int i = 0; i < node->childrenCount; i++)
+        {
+            CalculateBoneTransform(&node->children[i], globalTransformation);
+        }
+    }
+
+    void PlayAnimation(int animationIndex)
+    {
+        if (animationIndex >= 0 && animationIndex < static_cast<int>(m_Animations.size()))
+        {
+            m_CurrentAnimationIndex = animationIndex;
+            m_CurrentAnimation = &m_Animations[animationIndex];
+            m_CurrentTime = 0.0f;
+            m_PlayAnimation = true;
+        }
+    }
+
+    void ExtractBoneWeightForVertices(std::vector<Vertex>& vertices, aiMesh* mesh)
+    {
+        for (unsigned int boneIndex = 0; boneIndex < mesh->mNumBones; ++boneIndex)
+        {
+            aiBone* bone = mesh->mBones[boneIndex];
+            std::string boneName = bone->mName.data;
+
+            if (m_BoneInfoMap.find(boneName) == m_BoneInfoMap.end())
+            {
+                BoneInfo newBoneInfo;
+                newBoneInfo.id = m_BoneCounter;
+                newBoneInfo.offset = aiMatrixToGlmMat4(bone->mOffsetMatrix);
+                m_BoneInfoMap[boneName] = newBoneInfo;
+                m_BoneCounter++;
+            }
+
+            int boneID = m_BoneInfoMap[boneName].id;
+            auto& weights = bone->mWeights;
+
+            for (unsigned int weightIndex = 0; weightIndex < bone->mNumWeights; ++weightIndex)
+            {
+                int vertexID = weights[weightIndex].mVertexId;
+                float weight = weights[weightIndex].mWeight;
+
+                if (vertexID < vertices.size())
+                {
+                    for (int i = 0; i < MAX_BONE_INFLUENCE; ++i)
+                    {
+                        if (vertices[vertexID].weights[i] == 0.0f)
+                        {
+                            vertices[vertexID].weights[i] = weight;
+                            vertices[vertexID].boneIDs[i] = boneID;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     void createVertexBuffer()
     {
-        m_vertices = m_meshes[0].m_vertices; // Added this.
-        std::cout << "顶点数: " << m_vertices.size() << std::endl;
+        m_vertices.clear();
+        for (const auto& mesh : m_meshes)
+        {
+            m_vertices.insert(m_vertices.end(), mesh.m_vertices.begin(), mesh.m_vertices.end());
+        }
+
+        std::cout << "顶点总数: " << m_vertices.size() << std::endl;
         if (m_vertices.size() > 0)
         {
             std::cout << "第一个顶点位置: (" << m_vertices[0].pos.x << ", " << m_vertices[0].pos.y
@@ -1331,9 +1817,19 @@ private:
 
     void createIndexBuffer()
     {
-        m_indices = m_meshes[0].m_indices;
-        std::cout << "Number of meshes are: " << m_meshes.size() << std::endl;
-        std::cout << "索引数: " << m_indices.size() << std::endl;
+        m_indices.clear();
+        uint32_t vertexOffset = 0;
+        for (const auto& mesh : m_meshes)
+        {
+            for (auto index : mesh.m_indices)
+            {
+                m_indices.push_back(index + vertexOffset);
+            }
+            vertexOffset += static_cast<uint32_t>(mesh.m_vertices.size());
+        }
+
+        std::cout << "网格总数: " << m_meshes.size() << std::endl;
+        std::cout << "索引总数: " << m_indices.size() << std::endl;
         VkDeviceSize bufferSize = sizeof(m_indices[0]) * m_indices.size();
         VkBuffer stagingBuffer;
         VkDeviceMemory stagingBufferMemory;
@@ -1376,11 +1872,13 @@ private:
 
     void createDescriptorPool()
     {
-        std::array<VkDescriptorPoolSize, 2> poolSizes = {};
+        std::array<VkDescriptorPoolSize, 3> poolSizes = {};
         poolSizes[0].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
         poolSizes[0].descriptorCount = 1;
         poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         poolSizes[1].descriptorCount = 1;
+        poolSizes[2].type = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        poolSizes[2].descriptorCount = 1;
 
         VkDescriptorPoolCreateInfo poolInfo = {};
         poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -1418,7 +1916,12 @@ private:
         imageInfo.imageView = m_textureImageView;
         imageInfo.sampler = m_textureSampler;
 
-        std::array<VkWriteDescriptorSet, 2> descriptorWrites = {};
+        VkDescriptorBufferInfo boneBufferInfo = {};
+        boneBufferInfo.buffer = m_BoneMatrixBuffer;
+        boneBufferInfo.offset = 0;
+        boneBufferInfo.range = sizeof(glm::mat4) * MAX_BONES;
+
+        std::array<VkWriteDescriptorSet, 3> descriptorWrites = {};
 
         descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
         descriptorWrites[0].dstSet = m_descriptorSet;
@@ -1435,6 +1938,14 @@ private:
         descriptorWrites[1].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         descriptorWrites[1].descriptorCount = 1;
         descriptorWrites[1].pImageInfo = &imageInfo;
+
+        descriptorWrites[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        descriptorWrites[2].dstSet = m_descriptorSet;
+        descriptorWrites[2].dstBinding = 2;
+        descriptorWrites[2].dstArrayElement = 0;
+        descriptorWrites[2].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
+        descriptorWrites[2].descriptorCount = 1;
+        descriptorWrites[2].pBufferInfo = &boneBufferInfo;
 
         vkUpdateDescriptorSets(
             m_device,
